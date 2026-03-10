@@ -1,5 +1,6 @@
 import ipaddress
 import json
+import re
 from functools import wraps
 from typing import List, Optional, Tuple
 
@@ -8,6 +9,8 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from api.views import func_get_wireguard_status
+from dns.models import DNSSettings, StaticHost
+from dns.views import export_dns_configuration
 from routing_templates.models import RoutingTemplate
 from wireguard.models import Peer, PeerAllowedIP, WireGuardInstance
 from wireguard_peer.functions import func_create_new_peer
@@ -164,6 +167,32 @@ def _get_wireguard_instance(instance_name: str) -> Optional[WireGuardInstance]:
 
     return
 
+
+def _validate_dns_hostname(hostname: str) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(hostname, str):
+        return None, "Invalid hostname."
+
+    normalized = hostname.strip().lower()
+    if not normalized:
+        return None, "Invalid hostname."
+    if "://" in normalized or "/" in normalized or ":" in normalized:
+        return None, "Invalid hostname."
+
+    domain = normalized[2:] if normalized.startswith("*.") else normalized
+    labels = domain.split(".")
+    if len(labels) < 2:
+        return None, "Invalid hostname."
+
+    for label in labels:
+        if not label:
+            return None, "Invalid hostname."
+        if not re.match(r"^[a-z0-9-]+$", label):
+            return None, "Invalid hostname."
+        if label.startswith("-") or label.endswith("-"):
+            return None, "Invalid hostname."
+
+    return normalized, None
+
 @csrf_exempt
 @api_doc(
     summary="Create / Update / Delete a WireGuard peer (and optionally reload the interface)",
@@ -193,6 +222,8 @@ def _get_wireguard_instance(instance_name: str) -> Optional[WireGuardInstance]:
          "description": "Peer public key (create/update)."},
         {"name": "pre_shared_key", "in": "json", "type": "string", "required": False,
          "description": "Peer pre-shared key (create/update)."},
+        {"name": "allocation_cidr", "in": "json", "type": "string", "required": False,
+         "description": "Create only. Request auto-allocation of the peer main IP from this IPv4 CIDR (must be inside the instance network)."},
         {"name": "private_key", "in": "json", "type": "string", "required": False,
          "description": "Peer private key (create/update). Optional."},
         {"name": "persistent_keepalive", "in": "json", "type": "integer", "required": False,
@@ -217,6 +248,15 @@ def _get_wireguard_instance(instance_name: str) -> Optional[WireGuardInstance]:
                 "name": "John",
                 "routing_template_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
                 "announced_networks": ["10.10.0.0/24"],
+                "skip_reload": True
+            }
+        },
+        "create_with_subnet_allocation": {
+            "method": "POST",
+            "json": {
+                "instance": "wg0",
+                "name": "Jane",
+                "allocation_cidr": "10.0.0.64/26",
                 "skip_reload": True
             }
         },
@@ -280,6 +320,9 @@ def api_v2_manage_peer(request):
     with transaction.atomic():
         # CREATE
         if request.method == "POST":
+            # Lock the instance row during allocation+create to reduce race conditions on IP allocation.
+            wireguard_instance = WireGuardInstance.objects.select_for_update().get(pk=wireguard_instance.pk)
+
             peer_name = payload.get("name", "") or ""
             peer_public_key = payload.get("public_key") or None
             peer_pre_shared_key = payload.get("pre_shared_key") or None
@@ -293,6 +336,49 @@ def api_v2_manage_peer(request):
                     return JsonResponse({"status": "error", "error_message": "Invalid persistent_keepalive."}, status=400)
 
             peer_allowed_ip = payload.get("allowed_ip") or None
+            requested_allocation_cidr = payload.get("allocation_cidr")
+
+            if peer_allowed_ip and requested_allocation_cidr:
+                return JsonResponse(
+                    {"status": "error", "error_message": "Provide either allowed_ip or allocation_cidr, not both."},
+                    status=400
+                )
+
+            if requested_allocation_cidr is not None:
+                if not isinstance(requested_allocation_cidr, str) or not requested_allocation_cidr.strip():
+                    return JsonResponse({"status": "error", "error_message": "Invalid allocation_cidr."}, status=400)
+
+                try:
+                    requested_subnet = ipaddress.ip_network(requested_allocation_cidr.strip(), strict=False)
+                except Exception:
+                    return JsonResponse({"status": "error", "error_message": "Invalid allocation_cidr."}, status=400)
+
+                if requested_subnet.version != 4:
+                    return JsonResponse({"status": "error", "error_message": "Only IPv4 allocation_cidr is supported."}, status=400)
+
+                instance_network = wireguard_instance.network_cidr
+                if not instance_network:
+                    return JsonResponse({"status": "error", "error_message": "Invalid WireGuard instance network configuration."}, status=400)
+
+                try:
+                    instance_subnet = ipaddress.ip_network(str(instance_network), strict=False)
+                except Exception:
+                    return JsonResponse({"status": "error", "error_message": "Invalid WireGuard instance network configuration."}, status=400)
+
+                if not requested_subnet.subnet_of(instance_subnet):
+                    return JsonResponse(
+                        {"status": "error", "error_message": "allocation_cidr must be within the WireGuard instance network."},
+                        status=400
+                    )
+
+                allocated_ip = wireguard_instance.next_available_ip_in_cidr(str(requested_subnet))
+                if not allocated_ip:
+                    return JsonResponse(
+                        {"status": "error", "error_message": "No available IP address found in allocation_cidr."},
+                        status=400
+                    )
+                peer_allowed_ip = allocated_ip
+
             peer_allowed_ip_netmask = payload.get("allowed_ip_netmask")
             if peer_allowed_ip_netmask is not None:
                 try:
@@ -447,6 +533,135 @@ def api_v2_manage_peer(request):
             },
             status=200
         )
+
+
+@csrf_exempt
+@api_doc(
+    summary="Create or update (upsert via POST) a static DNS record identified by hostname",
+    auth="Header token: <ApiKey.token>",
+    methods=["POST", "PUT"],
+    params=[
+        {"name": "hostname", "in": "json", "type": "string", "required": True,
+         "description": "DNS hostname to manage (supports wildcard like *.example.com)."},
+        {"name": "ip_address", "in": "json", "type": "string", "required": True,
+         "description": "IPv4 address for the hostname record."},
+        {"name": "skip_apply", "in": "json", "type": "boolean", "required": False, "example": True,
+         "description": "If true, does not apply DNS changes immediately and only sets dns_settings.pending_changes=True."},
+    ],
+    returns=[
+        {"status": 200, "body": {"status": "success", "message": "DNS record updated successfully.", "hostname": "example.com", "ip_address": "10.0.0.50", "apply": {"success": True, "message": "..."}}},
+        {"status": 201, "body": {"status": "success", "message": "DNS record created successfully.", "hostname": "example.com", "ip_address": "10.0.0.50", "apply": {"success": True, "message": "..."}}},
+        {"status": 400, "body": {"status": "error", "error_message": "Invalid hostname."}},
+        {"status": 403, "body": {"status": "error", "error_message": "Invalid API key."}},
+        {"status": 404, "body": {"status": "error", "error_message": "DNS record not found for the provided hostname (PUT only)."}},
+        {"status": 405, "body": {"status": "error", "error_message": "Method not allowed."}},
+    ],
+    examples={
+        "create_skip_apply": {
+            "method": "POST",
+            "json": {
+                "hostname": "app.example.com",
+                "ip_address": "10.20.30.40",
+                "skip_apply": True
+            }
+        },
+        "post_upsert_update": {
+            "method": "POST",
+            "json": {
+                "hostname": "app.example.com",
+                "ip_address": "10.20.30.41",
+                "skip_apply": False
+            }
+        },
+        "update_apply": {
+            "method": "PUT",
+            "json": {
+                "hostname": "app.example.com",
+                "ip_address": "10.20.30.41",
+                "skip_apply": False
+            }
+        }
+    }
+)
+def api_v2_manage_dns_record(request):
+    if request.method not in ("POST", "PUT"):
+        return JsonResponse({"status": "error", "error_message": "Method not allowed."}, status=405)
+
+    try:
+        payload = json.loads(request.body.decode("utf-8")) if request.body else {}
+    except Exception:
+        return JsonResponse({"status": "error", "error_message": "Invalid JSON body."}, status=400)
+
+    api_key, api_error = validate_api_key(request)
+    if not api_key:
+        return JsonResponse({"status": "error", "error_message": api_error}, status=403)
+
+    normalized_hostname, hostname_error = _validate_dns_hostname(payload.get("hostname"))
+    if hostname_error:
+        return JsonResponse({"status": "error", "error_message": hostname_error}, status=400)
+
+    raw_ip = payload.get("ip_address")
+    if not isinstance(raw_ip, str) or not raw_ip.strip():
+        return JsonResponse({"status": "error", "error_message": "Invalid ip_address."}, status=400)
+
+    try:
+        ip = ipaddress.ip_address(raw_ip.strip())
+    except Exception:
+        return JsonResponse({"status": "error", "error_message": "Invalid ip_address."}, status=400)
+
+    if ip.version != 4:
+        return JsonResponse({"status": "error", "error_message": "Only IPv4 ip_address is supported."}, status=400)
+
+    skip_apply = bool(payload.get("skip_apply", False))
+    normalized_ip = str(ip)
+
+    with transaction.atomic():
+        dns_settings, _ = DNSSettings.objects.select_for_update().get_or_create(name="dns_settings")
+
+        if request.method == "POST":
+            record = StaticHost.objects.filter(hostname=normalized_hostname).first()
+            if record:
+                record.ip_address = normalized_ip
+                record.save(update_fields=["ip_address", "updated"])
+                action_message = "DNS record updated successfully."
+                status_code = 200
+            else:
+                record = StaticHost.objects.create(hostname=normalized_hostname, ip_address=normalized_ip)
+                action_message = "DNS record created successfully."
+                status_code = 201
+        else:
+            record = StaticHost.objects.filter(hostname=normalized_hostname).first()
+            if not record:
+                return JsonResponse(
+                    {"status": "error", "error_message": "DNS record not found for the provided hostname."},
+                    status=404,
+                )
+
+            record.ip_address = normalized_ip
+            record.save(update_fields=["ip_address", "updated"])
+            action_message = "DNS record updated successfully."
+            status_code = 200
+
+        if skip_apply:
+            dns_settings.pending_changes = True
+            dns_settings.save(update_fields=["pending_changes", "updated"])
+            apply_success = True
+            apply_message = "Changes saved. Apply skipped (pending_changes set to True)."
+        else:
+            export_dns_configuration()
+            apply_success = True
+            apply_message = "DNS configuration applied successfully."
+
+    return JsonResponse(
+        {
+            "status": "success",
+            "message": action_message,
+            "hostname": record.hostname,
+            "ip_address": str(record.ip_address),
+            "apply": {"success": apply_success, "message": apply_message},
+        },
+        status=status_code,
+    )
 
 
 @csrf_exempt

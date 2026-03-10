@@ -185,6 +185,44 @@ class WireGuardInstance(models.Model):
 
         return None
 
+    def next_available_ip_in_cidr(self, cidr: str) -> Optional[str]:
+        """
+        Returns the next available IPv4 address inside a caller-provided CIDR.
+
+        Rules:
+          - cidr must be valid IPv4 CIDR
+          - cidr must be fully contained by this instance network
+          - address must satisfy check_available_ip_address()
+        """
+        if not cidr:
+            return None
+
+        try:
+            requested_net = ipaddress.IPv4Network(str(cidr).strip(), strict=False)
+        except (ValueError, ipaddress.NetmaskValueError):
+            return None
+
+        instance_network = self.network_cidr
+        if not instance_network:
+            return None
+
+        try:
+            instance_net = ipaddress.IPv4Network(str(instance_network), strict=False)
+        except (ValueError, ipaddress.NetmaskValueError):
+            return None
+
+        if not requested_net.subnet_of(instance_net):
+            return None
+
+        candidates = list(requested_net.hosts()) if requested_net.num_addresses > 1 else [requested_net.network_address]
+
+        for ip in candidates:
+            ip_str = str(ip)
+            if self.check_available_ip_address(ip_str):
+                return ip_str
+
+        return None
+
 
 class Peer(models.Model):
     name = models.CharField(max_length=100, blank=True, null=True)
@@ -374,4 +412,3 @@ class PeerGroup(models.Model):
 
     def __str__(self):
         return self.name
-
