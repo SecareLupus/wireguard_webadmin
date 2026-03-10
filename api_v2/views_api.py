@@ -544,23 +544,24 @@ def api_v2_manage_peer(request):
 
 @csrf_exempt
 @api_doc(
-    summary="Create or update (upsert via POST) a static DNS record identified by hostname",
+    summary="Create, update, or delete a static DNS record identified by hostname",
     auth="Header token: <ApiKey.token>",
-    methods=["POST", "PUT"],
+    methods=["POST", "PUT", "DELETE"],
     params=[
         {"name": "hostname", "in": "json", "type": "string", "required": True,
          "description": "DNS hostname to manage (supports wildcard like *.example.com)."},
-        {"name": "ip_address", "in": "json", "type": "string", "required": True,
-         "description": "IPv4 address for the hostname record."},
+        {"name": "ip_address", "in": "json", "type": "string", "required": False,
+         "description": "IPv4 address for the hostname record (required for POST/PUT, ignored for DELETE)."},
         {"name": "skip_apply", "in": "json", "type": "boolean", "required": False, "example": True,
          "description": "If true, does not apply DNS changes immediately and only sets dns_settings.pending_changes=True."},
     ],
     returns=[
+        {"status": 200, "body": {"status": "success", "message": "DNS record deleted successfully.", "hostname": "example.com", "apply": {"success": True, "message": "..."}}},
         {"status": 200, "body": {"status": "success", "message": "DNS record updated successfully.", "hostname": "example.com", "ip_address": "10.0.0.50", "apply": {"success": True, "message": "..."}}},
         {"status": 201, "body": {"status": "success", "message": "DNS record created successfully.", "hostname": "example.com", "ip_address": "10.0.0.50", "apply": {"success": True, "message": "..."}}},
         {"status": 400, "body": {"status": "error", "error_message": "Invalid hostname."}},
         {"status": 403, "body": {"status": "error", "error_message": "Invalid API key."}},
-        {"status": 404, "body": {"status": "error", "error_message": "DNS record not found for the provided hostname (PUT only)."}},
+        {"status": 404, "body": {"status": "error", "error_message": "DNS record not found for the provided hostname."}},
         {"status": 405, "body": {"status": "error", "error_message": "Method not allowed."}},
     ],
     examples={
@@ -587,11 +588,18 @@ def api_v2_manage_peer(request):
                 "ip_address": "10.20.30.41",
                 "skip_apply": False
             }
+        },
+        "delete_skip_apply": {
+            "method": "DELETE",
+            "json": {
+                "hostname": "app.example.com",
+                "skip_apply": True
+            }
         }
     }
 )
 def api_v2_manage_dns_record(request):
-    if request.method not in ("POST", "PUT"):
+    if request.method not in ("POST", "PUT", "DELETE"):
         return JsonResponse({"status": "error", "error_message": "Method not allowed."}, status=405)
 
     try:
@@ -607,20 +615,21 @@ def api_v2_manage_dns_record(request):
     if hostname_error:
         return JsonResponse({"status": "error", "error_message": hostname_error}, status=400)
 
-    raw_ip = payload.get("ip_address")
-    if not isinstance(raw_ip, str) or not raw_ip.strip():
-        return JsonResponse({"status": "error", "error_message": "Invalid ip_address."}, status=400)
-
-    try:
-        ip = ipaddress.ip_address(raw_ip.strip())
-    except Exception:
-        return JsonResponse({"status": "error", "error_message": "Invalid ip_address."}, status=400)
-
-    if ip.version != 4:
-        return JsonResponse({"status": "error", "error_message": "Only IPv4 ip_address is supported."}, status=400)
-
     skip_apply = bool(payload.get("skip_apply", False))
-    normalized_ip = str(ip)
+    normalized_ip = None
+    if request.method in ("POST", "PUT"):
+        raw_ip = payload.get("ip_address")
+        if not isinstance(raw_ip, str) or not raw_ip.strip():
+            return JsonResponse({"status": "error", "error_message": "Invalid ip_address."}, status=400)
+
+        try:
+            ip = ipaddress.ip_address(raw_ip.strip())
+        except Exception:
+            return JsonResponse({"status": "error", "error_message": "Invalid ip_address."}, status=400)
+
+        if ip.version != 4:
+            return JsonResponse({"status": "error", "error_message": "Only IPv4 ip_address is supported."}, status=400)
+        normalized_ip = str(ip)
 
     with transaction.atomic():
         dns_settings, _ = DNSSettings.objects.select_for_update().get_or_create(name="dns_settings")
@@ -636,7 +645,7 @@ def api_v2_manage_dns_record(request):
                 record = StaticHost.objects.create(hostname=normalized_hostname, ip_address=normalized_ip)
                 action_message = "DNS record created successfully."
                 status_code = 201
-        else:
+        elif request.method == "PUT":
             record = StaticHost.objects.filter(hostname=normalized_hostname).first()
             if not record:
                 return JsonResponse(
@@ -647,6 +656,16 @@ def api_v2_manage_dns_record(request):
             record.ip_address = normalized_ip
             record.save(update_fields=["ip_address", "updated"])
             action_message = "DNS record updated successfully."
+            status_code = 200
+        else:
+            record = StaticHost.objects.filter(hostname=normalized_hostname).first()
+            if not record:
+                return JsonResponse(
+                    {"status": "error", "error_message": "DNS record not found for the provided hostname."},
+                    status=404,
+                )
+            record.delete()
+            action_message = "DNS record deleted successfully."
             status_code = 200
 
         if skip_apply:
@@ -659,16 +678,16 @@ def api_v2_manage_dns_record(request):
             apply_success = True
             apply_message = "DNS configuration applied successfully."
 
-    return JsonResponse(
-        {
-            "status": "success",
-            "message": action_message,
-            "hostname": record.hostname,
-            "ip_address": str(record.ip_address),
-            "apply": {"success": apply_success, "message": apply_message},
-        },
-        status=status_code,
-    )
+    response_data = {
+        "status": "success",
+        "message": action_message,
+        "hostname": normalized_hostname,
+        "apply": {"success": apply_success, "message": apply_message},
+    }
+    if request.method in ("POST", "PUT"):
+        response_data["ip_address"] = normalized_ip
+
+    return JsonResponse(response_data, status=status_code)
 
 
 @csrf_exempt

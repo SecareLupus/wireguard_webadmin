@@ -266,3 +266,38 @@ class ApiV2ManageDnsRecordTests(TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertIn("not found", response.json()["error_message"])
         mock_export.assert_not_called()
+
+    @patch("api_v2.views_api.export_dns_configuration")
+    def test_delete_dns_record_by_hostname(self, mock_export):
+        StaticHost.objects.create(hostname="del.example.com", ip_address="10.1.2.3")
+
+        response = self.client.delete(
+            self.url,
+            data=json.dumps({
+                "hostname": "del.example.com",
+                "skip_apply": True,
+            }),
+            content_type="application/json",
+            HTTP_TOKEN=str(self.api_key.token),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], "DNS record deleted successfully.")
+        self.assertFalse(StaticHost.objects.filter(hostname="del.example.com").exists())
+        mock_export.assert_not_called()
+
+    @patch("api_v2.views_api.export_dns_configuration")
+    def test_delete_returns_404_when_record_missing(self, mock_export):
+        response = self.client.delete(
+            self.url,
+            data=json.dumps({
+                "hostname": "missing-delete.example.com",
+                "skip_apply": False,
+            }),
+            content_type="application/json",
+            HTTP_TOKEN=str(self.api_key.token),
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("not found", response.json()["error_message"])
+        mock_export.assert_not_called()
