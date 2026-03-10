@@ -205,12 +205,19 @@ def _validate_dns_hostname(hostname: str) -> Tuple[Optional[str], Optional[str]]
          "description": "If true, does not reload the interface and only sets wireguard_instance.pending_changes=True."},
 
         {"name": "peer_uuid", "in": "json", "type": "string", "required": False,
-         "description": "Peer UUID used to select the peer for update/delete."},
+         "description": "Peer UUID used to select the peer for PUT/DELETE. Required when peer_public_key is not provided."},
         {"name": "peer_public_key", "in": "json", "type": "string", "required": False,
-         "description": "Peer public key used to select the peer for update/delete."},
+         "description": "Peer public key used to select the peer for PUT/DELETE. Required when peer_uuid is not provided."},
 
         {"name": "routing_template_uuid", "in": "json", "type": "string", "required": False,
          "description": "Routing template UUID (optional). Must belong to the same WireGuard instance."},
+
+        {"name": "name", "in": "json", "type": "string", "required": False, "example": "John",
+         "description": "Peer name (POST/create)."},
+        {"name": "allowed_ip", "in": "json", "type": "string", "required": False, "example": "10.0.0.20",
+         "description": "Peer main IPv4 address (POST/create). Mutually exclusive with allocation_cidr."},
+        {"name": "allowed_ip_netmask", "in": "json", "type": "integer", "required": False, "example": 32,
+         "description": "Netmask for allowed_ip (POST/create)."},
 
         {"name": "announced_networks", "in": "json", "type": "list[string]", "required": False,
          "example": ["10.10.0.0/24"], "description": "Server announced networks (priority>=1). Will be synced."},
@@ -670,13 +677,14 @@ def api_v2_manage_dns_record(request):
     auth="Header token: <ApiKey.token>",
     methods=["POST", "GET"],
     params=[
-        {"name": "instance", "in": "json", "type": "string", "required": True, "example": "wg2",
-         "description": "Required. Target instance name in the format wg{instance_id} (e.g. wg0, wg1)."},
+        {"name": "instance", "in": "json|query", "type": "string", "required": True, "example": "wg2",
+         "description": "Required. Target instance name in the format wg{instance_id} (e.g. wg0, wg1). Send in JSON for POST or query string for GET."},
     ],
     returns=[
         {"status": 200, "body": {"status": "success", "instance": "wg2", "peers": [{"uuid": "...", "public_key": "..."}]}},
         {"status": 400, "body": {"status": "error", "error_message": "Invalid or missing WireGuard instance."}},
         {"status": 403, "body": {"status": "error", "error_message": "Invalid API key."}},
+        {"status": 405, "body": {"status": "error", "error_message": "Method not allowed."}},
     ],
     examples={
         "list_wg2": {"method": "POST", "json": {"instance": "wg2"}},
@@ -744,18 +752,19 @@ def api_v2_peer_list(request):
     auth="Header token: <ApiKey.token>",
     methods=["POST", "GET"],
     params=[
-        {"name": "instance", "in": "json", "type": "string", "required": True, "example": "wg2",
-         "description": "Required. Target instance name in the format wg{instance_id} (e.g. wg0, wg1)."},
-        {"name": "peer_uuid", "in": "json", "type": "string", "required": False,
-         "description": "Peer UUID selector."},
-        {"name": "peer_public_key", "in": "json", "type": "string", "required": False,
-         "description": "Peer public key selector."},
+        {"name": "instance", "in": "json|query", "type": "string", "required": True, "example": "wg2",
+         "description": "Required. Target instance name in the format wg{instance_id} (e.g. wg0, wg1). Send in JSON for POST or query string for GET."},
+        {"name": "peer_uuid", "in": "json|query", "type": "string", "required": False,
+         "description": "Peer UUID selector. Required when peer_public_key is not provided."},
+        {"name": "peer_public_key", "in": "json|query", "type": "string", "required": False,
+         "description": "Peer public key selector. Required when peer_uuid is not provided."},
     ],
     returns=[
         {"status": 200, "body": {"status": "success", "peer": {"uuid": "...", "name": "...", "public_key": "..."}}},
         {"status": 400, "body": {"status": "error", "error_message": "Missing peer selector (peer_uuid or peer_public_key)."}},
         {"status": 404, "body": {"status": "error", "error_message": "Peer not found."}},
         {"status": 403, "body": {"status": "error", "error_message": "Invalid API key."}},
+        {"status": 405, "body": {"status": "error", "error_message": "Method not allowed."}},
     ],
     examples={
         "detail_by_uuid": {"method": "POST", "json": {"instance": "wg2", "peer_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}},
